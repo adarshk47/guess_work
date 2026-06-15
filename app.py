@@ -594,7 +594,7 @@ def render_strike_volume_tab(options_df: pd.DataFrame, spot: float, candle_data_
         st.info("Loading strike data...")
 
 
-def render_paper_trade_tab(patterns, spot: float):
+def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None):
     st.markdown("### 📝 Paper Trading – Auto Signals")
     market_open = is_market_open()
     effective_spot = spot if spot and spot > 0 else st.session_state.get("_last_ltp", 22000.0)
@@ -611,8 +611,24 @@ def render_paper_trade_tab(patterns, spot: float):
             pat_name = getattr(pat, "pattern", getattr(pat, "name", "Signal"))
             sim = not market_open
             if should_add_new_trade(pat_name, pat.signal, simulated=sim):
+                # Use actual candle timestamp so trade time reflects when
+                # the pattern formed, not when the app was (re)started.
+                trade_time = None
+                pat_ts = getattr(pat, "timestamp", None)
+                if pat_ts is not None:
+                    try:
+                        trade_time = pd.Timestamp(pat_ts).to_pydatetime()
+                    except Exception:
+                        trade_time = None
+                elif candle_df is not None and not candle_df.empty:
+                    idx = getattr(pat, "index", getattr(pat, "bar_index", -1))
+                    if 0 <= idx < len(candle_df):
+                        try:
+                            trade_time = pd.Timestamp(candle_df["timestamp"].iloc[idx]).to_pydatetime()
+                        except Exception:
+                            trade_time = None
                 add_paper_trade(pat, pat_name, effective_spot,
-                                source="AUTO", simulated=sim)
+                                source="AUTO", simulated=sim, trade_time=trade_time)
 
     # Update open trade statuses
     update_paper_trades(spot)
@@ -1044,7 +1060,7 @@ def main():
         render_strike_volume_tab(options_df, ltp, candle_data_by_tf)
 
     with tab3:
-        render_paper_trade_tab(patterns, ltp)
+        render_paper_trade_tab(patterns, ltp, candle_df)
 
     with tab4:
         render_oi_table_tab(candle_data_by_tf, options_df, ltp)
