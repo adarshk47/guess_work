@@ -30,10 +30,13 @@ def init_paper_trades():
 
 
 def add_paper_trade(signal, pattern_name: str, spot_price: float,
-                    source: str = "AUTO", simulated: bool = False):
+                    source: str = "AUTO", simulated: bool = False,
+                    trade_time: datetime = None):
     """Add a new paper trade from a pattern signal (live or simulated)."""
     init_paper_trades()
-    now = datetime.now(IST)
+    now = trade_time if trade_time is not None else datetime.now(IST)
+    if now.tzinfo is None:
+        now = IST.localize(now)
     st.session_state["paper_trade_counter"] += 1
     trade_id = st.session_state["paper_trade_counter"]
 
