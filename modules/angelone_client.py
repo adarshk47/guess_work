@@ -163,161 +163,125 @@ def is_market_open() -> bool:
     return market_open <= now <= market_close
 
 
-import re as _re
+def _candidate_expiry_strings(ref_date=None) -> list:
+    """
+    Generate candidate NIFTY expiry strings to probe (next 6 Thursdays).
+    Returns list of strings in '19JUN2026' format.
+    """
+    from datetime import date as _date
+    today = ref_date or datetime.now(IST).date()
+    candidates = []
+    d = today
+    for _ in range(6):
+        days_ahead = (3 - d.weekday()) % 7  # next Thursday
+        if days_ahead == 0:
+            days_ahead = 7
+        d = d + timedelta(days=days_ahead)
+        candidates.append(d.strftime("%d%b%Y").upper())
+    return candidates
 
 
 @st.cache_data(ttl=1800)
-def _fetch_expiries_from_api() -> list:
+def _find_valid_nifty_expiry_via_api() -> str:
     """
-    Fetch real NIFTY option expiry dates from AngelOne via searchScrip.
-    Handles symbol formats: NIFTY19JUN26CE24000 (2-digit yr)
-                            NIFTY19JUN2026CE24000 (4-digit yr)
-    Returns sorted list of date objects; empty list if API unavailable.
-    """
-    obj = get_client()
-    if obj is None:
-        return []
-    try:
-        result = obj.searchScrip("NFO", "NIFTY")
-        if not (result and result.get("status") and result.get("data")):
-            return []
-        expiry_dates = set()
-        # NSE NFO symbols: NIFTY<DD><MMM><YY|YYYY><CE|PE><STRIKE>
-        pat = _re.compile(r"^NIFTY(\d{2})([A-Z]{3})(\d{2,4})(CE|PE)(\d+)$")
-        for item in result["data"]:
-            # searchScrip may return 'tradingsymbol' or 'symbolname'
-            sym = (item.get("tradingsymbol") or item.get("symbolname") or
-                   item.get("symbol") or "").upper()
-            m = pat.match(sym)
-            if m:
-                day, mon, yr = m.group(1), m.group(2), m.group(3)
-                yr = yr if len(yr) == 4 else f"20{yr}"
-                try:
-                    expiry_dates.add(
-                        datetime.strptime(f"{day}{mon}{yr}", "%d%b%Y").date()
-                    )
-                except Exception:
-                    pass
-        return sorted(expiry_dates)
-    except Exception as e:
-        logger.debug(f"searchScrip expiry fetch failed: {e}")
-        return []
-
-
-@st.cache_data(ttl=300)
-def _load_nifty_option_master_from_api(expiry_str: str) -> pd.DataFrame:
-    """
-    Build option master (token, strike, option_type) directly from AngelOne
-    searchScrip — used when the public scrip master URL is unreachable.
-    expiry_str must be like '19JUN2026'.
+    Try candidate expiry strings against AngelOne's optionGreek endpoint.
+    The first one that returns non-empty data is the correct live expiry.
+    Returns expiry string like '19JUN2026', or '' if none found / not connected.
     """
     obj = get_client()
     if obj is None:
-        return pd.DataFrame()
-    try:
-        # Build both 2-digit and 4-digit year patterns for matching
-        expiry_dt = datetime.strptime(expiry_str, "%d%b%Y")
-        exp_short = expiry_dt.strftime("%d%b%y").upper()   # 19JUN26
-        exp_long = expiry_str.upper()                       # 19JUN2026
-        result = obj.searchScrip("NFO", "NIFTY")
-        if not (result and result.get("status") and result.get("data")):
-            return pd.DataFrame()
-        pat = _re.compile(r"^NIFTY(\d{2})([A-Z]{3})(\d{2,4})(CE|PE)(\d+)$")
-        rows = []
-        for item in result["data"]:
-            sym = (item.get("tradingsymbol") or item.get("symbolname") or
-                   item.get("symbol") or "").upper()
-            token = str(item.get("symboltoken") or item.get("token") or "")
-            m = pat.match(sym)
-            if not m or not token:
-                continue
-            day, mon, yr, opt_type, strike_str = m.groups()
-            yr = yr if len(yr) == 4 else f"20{yr}"
-            exp_in_sym = f"{day}{mon}{yr}"
-            if exp_in_sym not in (exp_short, exp_long,
-                                   expiry_dt.strftime("%d%b%Y").upper()):
-                continue
-            try:
-                rows.append({
-                    "strike": float(strike_str),
-                    "option_type": opt_type,
-                    "token": token,
-                    "symbol": sym,
-                })
-            except Exception:
-                pass
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
-    except Exception as e:
-        logger.debug(f"API option master fetch failed: {e}")
-        return pd.DataFrame()
-
-
-def _next_thursday(ref_date) -> "date":
-    """Return the nearest upcoming Thursday on or after ref_date."""
-    days_ahead = (3 - ref_date.weekday()) % 7  # Thursday = weekday 3
-    return ref_date + timedelta(days=days_ahead if days_ahead > 0 else 7)
+        return ""
+    for expiry_str in _candidate_expiry_strings():
+        try:
+            gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
+            if gr and gr.get("status") and gr.get("data") and len(gr["data"]) > 5:
+                logger.info(f"Valid NIFTY expiry confirmed via optionGreek: {expiry_str}")
+                return expiry_str
+        except Exception:
+            pass
+    return ""
 
 
 def get_next_weekly_expiry() -> datetime:
     """
     Get the next NIFTY option expiry.
 
-    Priority order:
-    1. AngelOne searchScrip API (authenticated, exact expiry list from exchange)
-    2. Public NFO scrip master URL
-    3. Last known expiry cached in session_state
-    4. Next Thursday as last resort (displayed with a warning — may be wrong)
+    Priority:
+    1. Validate via optionGreek API (most reliable — confirmed by exchange data)
+    2. AngelOne searchScrip symbol parsing
+    3. Public NFO scrip master URL
+    4. Session-state cache from last successful fetch
+    5. Next Thursday (last resort, may be wrong)
     """
     now = datetime.now(IST)
     today = now.date()
     mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-    def _pick(expiry_dates):
-        future = sorted(d for d in expiry_dates if d >= today)
-        if not future:
+    def _as_dt(expiry_str: str):
+        try:
+            d = datetime.strptime(expiry_str, "%d%b%Y").date()
+            return datetime.combine(d, datetime.min.time()).replace(tzinfo=IST)
+        except Exception:
             return None
-        nearest = future[0]
-        if nearest == today and now > mkt_close and len(future) > 1:
-            nearest = future[1]
-        return nearest
 
-    # ── 1. AngelOne authenticated API ────────────────────────────────────────
+    # ── 1. optionGreek validation (most accurate) ─────────────────────────────
+    try:
+        valid = _find_valid_nifty_expiry_via_api()
+        if valid:
+            expiry_dt = _as_dt(valid)
+            if expiry_dt:
+                st.session_state["_last_known_expiry"] = expiry_dt
+                st.session_state["_expiry_source"] = "AngelOne optionGreek"
+                return expiry_dt
+    except Exception as e:
+        logger.debug(f"optionGreek expiry validation failed: {e}")
+
+    # ── 2. searchScrip symbol parsing ─────────────────────────────────────────
     try:
         api_expiries = _fetch_expiries_from_api()
         if api_expiries:
-            nearest = _pick(api_expiries)
-            if nearest:
+            future = sorted(d for d in api_expiries if d >= today)
+            if future:
+                nearest = future[0]
+                if nearest == today and now > mkt_close and len(future) > 1:
+                    nearest = future[1]
                 expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
                 st.session_state["_last_known_expiry"] = expiry_dt
-                st.session_state["_expiry_source"] = "AngelOne API"
+                st.session_state["_expiry_source"] = "AngelOne searchScrip"
                 return expiry_dt
     except Exception as e:
-        logger.debug(f"API expiry pick failed: {e}")
+        logger.debug(f"searchScrip expiry failed: {e}")
 
-    # ── 2. Public NFO scrip master ────────────────────────────────────────────
+    # ── 3. Public scrip master ─────────────────────────────────────────────────
     try:
         master_expiries = _load_nifty_expiries()
         if master_expiries:
-            nearest = _pick(master_expiries)
-            if nearest:
+            future = sorted(d for d in master_expiries if d >= today)
+            if future:
+                nearest = future[0]
+                if nearest == today and now > mkt_close and len(future) > 1:
+                    nearest = future[1]
                 expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
                 st.session_state["_last_known_expiry"] = expiry_dt
                 st.session_state["_expiry_source"] = "scrip master"
                 return expiry_dt
     except Exception as e:
-        logger.debug(f"Scrip master expiry pick failed: {e}")
+        logger.debug(f"Scrip master expiry failed: {e}")
 
-    # ── 3. Cached from last successful fetch ──────────────────────────────────
+    # ── 4. Session-state cache ─────────────────────────────────────────────────
     cached = st.session_state.get("_last_known_expiry")
     if cached is not None:
         cached_date = cached.date() if hasattr(cached, "date") else cached
         if cached_date >= today:
             return cached
 
-    # ── 4. Last resort: next Thursday (may not match actual NSE expiry) ───────
-    thursday = _next_thursday(today)
+    # ── 5. Next Thursday (absolute last resort) ───────────────────────────────
+    days_ahead = (3 - today.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    thursday = today + timedelta(days=days_ahead)
     expiry_dt = datetime.combine(thursday, datetime.min.time()).replace(tzinfo=IST)
-    st.session_state["_expiry_source"] = "estimated (Thursday)"
+    st.session_state["_expiry_source"] = "estimated Thursday"
     return expiry_dt
 
 
@@ -403,10 +367,84 @@ def fetch_candle_data(interval_minutes: int = 1, lookback_bars: int = 200) -> pd
         return _EMPTY_CANDLES.copy()
 
 
+import re as _re
+
 _SCRIP_MASTER_URL = (
     "https://margincalculator.angelbroking.com/OpenAPI_File/files/"
     "OpenAPISymbolMaster.json"
 )
+
+
+@st.cache_data(ttl=1800)
+def _fetch_expiries_from_api() -> list:
+    """
+    Parse NIFTY option expiry dates from AngelOne searchScrip symbols.
+    Handles: NIFTY19JUN26CE24000 (2-digit yr) and NIFTY19JUN2026CE24000 (4-digit yr).
+    """
+    obj = get_client()
+    if obj is None:
+        return []
+    try:
+        result = obj.searchScrip("NFO", "NIFTY")
+        if not (result and result.get("status") and result.get("data")):
+            return []
+        pat = _re.compile(r"^NIFTY(\d{2})([A-Z]{3})(\d{2,4})(CE|PE)(\d+)$")
+        expiry_dates = set()
+        for item in result["data"]:
+            sym = (item.get("tradingsymbol") or item.get("symbolname") or
+                   item.get("symbol") or "").upper()
+            m = pat.match(sym)
+            if m:
+                day, mon, yr = m.group(1), m.group(2), m.group(3)
+                yr = yr if len(yr) == 4 else f"20{yr}"
+                try:
+                    expiry_dates.add(datetime.strptime(f"{day}{mon}{yr}", "%d%b%Y").date())
+                except Exception:
+                    pass
+        return sorted(expiry_dates)
+    except Exception as e:
+        logger.debug(f"searchScrip expiry fetch failed: {e}")
+        return []
+
+
+@st.cache_data(ttl=300)
+def _load_nifty_option_master_from_api(expiry_str: str) -> pd.DataFrame:
+    """
+    Build option master (token, strike, option_type) via AngelOne searchScrip.
+    Used when the public scrip master URL is unreachable.
+    """
+    obj = get_client()
+    if obj is None:
+        return pd.DataFrame()
+    try:
+        expiry_dt = datetime.strptime(expiry_str, "%d%b%Y")
+        exp_short = expiry_dt.strftime("%d%b%y").upper()   # 19JUN26
+        exp_long = expiry_str.upper()                       # 19JUN2026
+        result = obj.searchScrip("NFO", "NIFTY")
+        if not (result and result.get("status") and result.get("data")):
+            return pd.DataFrame()
+        pat = _re.compile(r"^NIFTY(\d{2})([A-Z]{3})(\d{2,4})(CE|PE)(\d+)$")
+        rows = []
+        for item in result["data"]:
+            sym = (item.get("tradingsymbol") or item.get("symbolname") or
+                   item.get("symbol") or "").upper()
+            token = str(item.get("symboltoken") or item.get("token") or "")
+            m = pat.match(sym)
+            if not m or not token:
+                continue
+            day, mon, yr, opt_type, strike_str = m.groups()
+            yr_full = yr if len(yr) == 4 else f"20{yr}"
+            if f"{day}{mon}{yr_full}" not in (exp_short, exp_long):
+                continue
+            try:
+                rows.append({"strike": float(strike_str), "option_type": opt_type,
+                             "token": token, "symbol": sym})
+            except Exception:
+                pass
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception as e:
+        logger.debug(f"API option master fetch failed: {e}")
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600)
@@ -488,115 +526,132 @@ def _chunked(seq, n):
         yield seq[i:i + n]
 
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=30)
 def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
     """
-    Fetch the NIFTY options chain (ATM ±12 strikes) from AngelOne:
-      • getMarketData(FULL) → OI, volume, LTP, best bid/ask per strike
-      • optionGreek         → delta, gamma, theta, vega, IV per strike
-    Returns one row per strike with ce_*/pe_* columns.
-    Returns an empty DataFrame if not connected — no simulated data.
+    Fetch NIFTY options chain (ATM ±12 strikes).
+
+    Two-stage approach so partial data is always better than no data:
+      Stage 1 — optionGreek: greeks + IV for all strikes. Needs only
+                expiry string (no tokens). Works even if scrip master fails.
+      Stage 2 — getMarketData: OI, volume, LTP. Needs token list from
+                scrip master or searchScrip.
+    Returns merged DataFrame; falls back to last cached result if empty.
     """
     try:
-        if expiry_str is None:
+        if expiry_str is None or expiry_str == "---":
             expiry_dt = get_next_weekly_expiry()
             expiry_str = get_expiry_string(expiry_dt)
 
         obj = get_client()
         if obj is None:
-            return pd.DataFrame()
+            return st.session_state.get("_last_options_df", pd.DataFrame())
 
-        master = _load_nifty_option_master(expiry_str)
-        if master.empty:
-            logger.error(f"No NIFTY options found in master for expiry {expiry_str}")
-            return pd.DataFrame()
-
-        # Limit to ATM ±12 strikes to stay within the 50-token market-data cap
         spot = fetch_ltp()
-        all_strikes = sorted(master["strike"].unique())
-        if spot and spot > 0:
-            atm = min(all_strikes, key=lambda s: abs(s - spot))
-            atm_idx = all_strikes.index(atm)
-            lo = max(0, atm_idx - 12)
-            hi = min(len(all_strikes), atm_idx + 13)
-            keep = set(all_strikes[lo:hi])
-            master = master[master["strike"].isin(keep)]
 
-        token_to_meta = {
-            r["token"]: (r["strike"], r["option_type"])
-            for _, r in master.iterrows()
-        }
-        tokens = list(token_to_meta.keys())
-
-        # ── Market data (OI / volume / LTP / depth) ──────────────────────────
-        md_by_token = {}
-        for batch in _chunked(tokens, 50):
-            try:
-                md = obj.getMarketData("FULL", {"NFO": batch})
-                if md and md.get("status") and md.get("data"):
-                    for item in md["data"].get("fetched", []):
-                        md_by_token[str(item.get("symbolToken"))] = item
-            except Exception as e:
-                logger.error(f"getMarketData error: {e}")
-
-        # ── Greeks (delta / gamma / theta / vega / IV) ───────────────────────
-        greeks_by_key = {}
+        # ── Stage 1: Greeks via optionGreek (no tokens needed) ───────────────
+        greeks_by_key: dict = {}
+        greek_strikes: set = set()
         try:
             gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
             if gr and gr.get("status") and gr.get("data"):
                 for g in gr["data"]:
                     try:
-                        k = (float(g.get("strikePrice", 0)), g.get("optionType", "").upper())
-                        greeks_by_key[k] = g
+                        strike = float(g.get("strikePrice", 0))
+                        ot = g.get("optionType", "").upper()
+                        greeks_by_key[(strike, ot)] = g
+                        greek_strikes.add(strike)
                     except Exception:
                         pass
         except Exception as e:
             logger.error(f"optionGreek error: {e}")
 
-        def _best_depth(item, side):
+        # ── Stage 2: Market data via tokens (OI / volume / LTP) ──────────────
+        master = _load_nifty_option_master(expiry_str)
+        strike_opt_to_md: dict = {}
+
+        if not master.empty:
+            all_strikes = sorted(master["strike"].unique())
+            if spot and spot > 0:
+                atm = min(all_strikes, key=lambda s: abs(s - spot))
+                atm_idx = all_strikes.index(atm)
+                lo, hi = max(0, atm_idx - 12), min(len(all_strikes), atm_idx + 13)
+                keep = set(all_strikes[lo:hi])
+                master = master[master["strike"].isin(keep)]
+
+            token_to_meta = {
+                r["token"]: (r["strike"], r["option_type"])
+                for _, r in master.iterrows()
+            }
+            md_by_token: dict = {}
+            for batch in _chunked(list(token_to_meta.keys()), 50):
+                try:
+                    md = obj.getMarketData("FULL", {"NFO": batch})
+                    if md and md.get("status") and md.get("data"):
+                        for item in md["data"].get("fetched", []):
+                            md_by_token[str(item.get("symbolToken"))] = item
+                except Exception as e:
+                    logger.error(f"getMarketData error: {e}")
+            for tok, item in md_by_token.items():
+                meta = token_to_meta.get(tok)
+                if meta:
+                    strike_opt_to_md[meta] = item
+
+        # ── Determine which strikes to include ────────────────────────────────
+        all_avail = sorted(
+            (master["strike"].unique().tolist() if not master.empty else []) or
+            sorted(greek_strikes)
+        )
+        if spot and spot > 0 and all_avail:
+            atm = min(all_avail, key=lambda s: abs(s - spot))
+            idx = all_avail.index(atm)
+            use_strikes = set(all_avail[max(0, idx - 12):idx + 13])
+        else:
+            use_strikes = set(all_avail[:25]) or greek_strikes
+
+        # ── Assemble rows ─────────────────────────────────────────────────────
+        def _depth(item, side):
             try:
                 lvls = item.get("depth", {}).get(side, [])
                 return float(lvls[0].get("price", 0)) if lvls else 0.0
             except Exception:
                 return 0.0
 
-        # ── Assemble per-strike rows ─────────────────────────────────────────
-        strikes = sorted(master["strike"].unique())
         rows = []
-        for strike in strikes:
+        for strike in sorted(use_strikes):
             row = {"strike": float(strike)}
             for opt in ("ce", "pe"):
                 ot = opt.upper()
-                sub = master[(master["strike"] == strike) & (master["option_type"] == ot)]
-                md = md_by_token.get(sub["token"].iloc[0]) if not sub.empty else None
+                md = strike_opt_to_md.get((float(strike), ot))
                 g = greeks_by_key.get((float(strike), ot), {})
-                if md:
-                    row[f"{opt}_oi"] = int(float(md.get("opnInterest", 0) or 0))
-                    row[f"{opt}_volume"] = int(float(md.get("tradeVolume", 0) or 0))
-                    row[f"{opt}_ltp"] = float(md.get("ltp", 0) or 0)
-                    row[f"{opt}_bid"] = _best_depth(md, "buy")
-                    row[f"{opt}_ask"] = _best_depth(md, "sell")
-                else:
-                    row[f"{opt}_oi"] = 0
-                    row[f"{opt}_volume"] = 0
-                    row[f"{opt}_ltp"] = 0.0
-                    row[f"{opt}_bid"] = 0.0
-                    row[f"{opt}_ask"] = 0.0
-                row[f"{opt}_iv"] = float(g.get("impliedVolatility", 0) or 0)
-                row[f"{opt}_delta"] = float(g.get("delta", 0) or 0)
-                row[f"{opt}_gamma"] = float(g.get("gamma", 0) or 0)
-                row[f"{opt}_theta"] = float(g.get("theta", 0) or 0)
-                row[f"{opt}_vega"] = float(g.get("vega", 0) or 0)
+                row[f"{opt}_oi"]     = int(float(md.get("opnInterest", 0) or 0)) if md else 0
+                row[f"{opt}_volume"] = int(float(md.get("tradeVolume", 0) or 0)) if md else 0
+                row[f"{opt}_ltp"]    = float(md.get("ltp", 0) or 0) if md else float(g.get("ltp", 0) or 0)
+                row[f"{opt}_bid"]    = _depth(md, "buy") if md else 0.0
+                row[f"{opt}_ask"]    = _depth(md, "sell") if md else 0.0
+                row[f"{opt}_iv"]     = float(g.get("impliedVolatility", 0) or 0)
+                row[f"{opt}_delta"]  = float(g.get("delta", 0) or 0)
+                row[f"{opt}_gamma"]  = float(g.get("gamma", 0) or 0)
+                row[f"{opt}_theta"]  = float(g.get("theta", 0) or 0)
+                row[f"{opt}_vega"]   = float(g.get("vega", 0) or 0)
             rows.append(row)
 
-        df = pd.DataFrame(rows)
-        df.sort_values("strike", inplace=True)
-        df.reset_index(drop=True, inplace=True)
+        if not rows:
+            # Nothing live — return last session's cached data so tabs still show
+            cached = st.session_state.get("_last_options_df", pd.DataFrame())
+            if not cached.empty:
+                logger.info("Options chain empty — returning last cached data")
+            return cached
+
+        df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
+        # Cache so next refresh can fall back to this if live fetch fails
+        st.session_state["_last_options_df"] = df.copy()
+        st.session_state["_last_options_expiry"] = expiry_str
         return df
 
     except Exception as e:
         logger.error(f"Options chain error: {e}")
-        return pd.DataFrame()
+        return st.session_state.get("_last_options_df", pd.DataFrame())
 
 
 def get_atm_strike(spot_price: float, step: int = 50) -> int:
