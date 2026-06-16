@@ -170,7 +170,8 @@ import re as _re
 def _fetch_expiries_from_api() -> list:
     """
     Fetch real NIFTY option expiry dates from AngelOne via searchScrip.
-    Parses expiry from the trading symbol name (e.g. NIFTY19JUN26C24000).
+    Handles symbol formats: NIFTY19JUN26CE24000 (2-digit yr)
+                            NIFTY19JUN2026CE24000 (4-digit yr)
     Returns sorted list of date objects; empty list if API unavailable.
     """
     obj = get_client()
@@ -181,17 +182,17 @@ def _fetch_expiries_from_api() -> list:
         if not (result and result.get("status") and result.get("data")):
             return []
         expiry_dates = set()
+        # NSE NFO symbols: NIFTY<DD><MMM><YY|YYYY><CE|PE><STRIKE>
+        pat = _re.compile(r"^NIFTY(\d{2})([A-Z]{3})(\d{2,4})(CE|PE)(\d+)$")
         for item in result["data"]:
-            sym = item.get("tradingsymbol", "")
-            # Two common formats in NSE:
-            #   NIFTY19JUN26C24000  (2-digit year)
-            #   NIFTY19JUN2026CE24000 (4-digit year)
-            m = _re.match(r"NIFTY(\d{2})([A-Z]{3})(\d{2,4})[CP]", sym)
+            # searchScrip may return 'tradingsymbol' or 'symbolname'
+            sym = (item.get("tradingsymbol") or item.get("symbolname") or
+                   item.get("symbol") or "").upper()
+            m = pat.match(sym)
             if m:
-                day, mon, yr = m.groups()
+                day, mon, yr = m.group(1), m.group(2), m.group(3)
                 yr = yr if len(yr) == 4 else f"20{yr}"
                 try:
-                    from datetime import date as _date
                     expiry_dates.add(
                         datetime.strptime(f"{day}{mon}{yr}", "%d%b%Y").date()
                     )
@@ -201,6 +202,54 @@ def _fetch_expiries_from_api() -> list:
     except Exception as e:
         logger.debug(f"searchScrip expiry fetch failed: {e}")
         return []
+
+
+@st.cache_data(ttl=300)
+def _load_nifty_option_master_from_api(expiry_str: str) -> pd.DataFrame:
+    """
+    Build option master (token, strike, option_type) directly from AngelOne
+    searchScrip — used when the public scrip master URL is unreachable.
+    expiry_str must be like '19JUN2026'.
+    """
+    obj = get_client()
+    if obj is None:
+        return pd.DataFrame()
+    try:
+        # Build both 2-digit and 4-digit year patterns for matching
+        expiry_dt = datetime.strptime(expiry_str, "%d%b%Y")
+        exp_short = expiry_dt.strftime("%d%b%y").upper()   # 19JUN26
+        exp_long = expiry_str.upper()                       # 19JUN2026
+        result = obj.searchScrip("NFO", "NIFTY")
+        if not (result and result.get("status") and result.get("data")):
+            return pd.DataFrame()
+        pat = _re.compile(r"^NIFTY(\d{2})([A-Z]{3})(\d{2,4})(CE|PE)(\d+)$")
+        rows = []
+        for item in result["data"]:
+            sym = (item.get("tradingsymbol") or item.get("symbolname") or
+                   item.get("symbol") or "").upper()
+            token = str(item.get("symboltoken") or item.get("token") or "")
+            m = pat.match(sym)
+            if not m or not token:
+                continue
+            day, mon, yr, opt_type, strike_str = m.groups()
+            yr = yr if len(yr) == 4 else f"20{yr}"
+            exp_in_sym = f"{day}{mon}{yr}"
+            if exp_in_sym not in (exp_short, exp_long,
+                                   expiry_dt.strftime("%d%b%Y").upper()):
+                continue
+            try:
+                rows.append({
+                    "strike": float(strike_str),
+                    "option_type": opt_type,
+                    "token": token,
+                    "symbol": sym,
+                })
+            except Exception:
+                pass
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception as e:
+        logger.debug(f"API option master fetch failed: {e}")
+        return pd.DataFrame()
 
 
 def _next_thursday(ref_date) -> "date":
@@ -413,14 +462,25 @@ def _load_nifty_expiries() -> list:
 
 def _load_nifty_option_master(expiry_str: str) -> pd.DataFrame:
     """
-    Return NIFTY index options for the given expiry from the cached master.
-    Columns: strike, option_type (CE/PE), token, symbol.
+    Return NIFTY index options for the given expiry.
+    Tries public scrip master first; falls back to AngelOne searchScrip API.
     """
-    raw = _load_nifty_master_raw()
-    if raw.empty:
-        return pd.DataFrame()
-    sub = raw[raw["expiry"] == expiry_str.upper()]
-    return sub[["strike", "option_type", "token", "symbol"]].reset_index(drop=True)
+    # Primary: public scrip master (cached, no auth needed)
+    try:
+        raw = _load_nifty_master_raw()
+        if not raw.empty:
+            sub = raw[raw["expiry"] == expiry_str.upper()]
+            if not sub.empty:
+                return sub[["strike", "option_type", "token", "symbol"]].reset_index(drop=True)
+    except Exception as e:
+        logger.warning(f"Scrip master option lookup failed: {e}")
+
+    # Fallback: AngelOne searchScrip API (needs auth but no external URL)
+    logger.info(f"Falling back to API-based option master for {expiry_str}")
+    api_master = _load_nifty_option_master_from_api(expiry_str)
+    if not api_master.empty:
+        st.session_state["_option_master_source"] = "AngelOne API"
+    return api_master
 
 
 def _chunked(seq, n):

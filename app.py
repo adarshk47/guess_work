@@ -1035,6 +1035,22 @@ def main():
     expiry_str = get_expiry_string(expiry_dt)
     options_df = fetch_options_chain(expiry_str)
 
+    # ── Debug expander (always visible so user can diagnose issues) ───────────
+    expiry_src = st.session_state.get("_expiry_source", "unknown")
+    opt_src = st.session_state.get("_option_master_source", "scrip master")
+    opt_rows = len(options_df) if options_df is not None and not options_df.empty else 0
+    with st.expander(f"🔍 Data Status — Expiry: {expiry_str} | Options strikes: {opt_rows}", expanded=(opt_rows == 0)):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Expiry", expiry_str)
+        c2.metric("Expiry Source", expiry_src)
+        c3.metric("Option Strikes", opt_rows)
+        if opt_rows == 0:
+            st.error("⚠️ Options chain empty — OI / Greeks / Strike tabs will show no data. "
+                     "Possible causes: (1) wrong expiry, (2) scrip master + API both failed, "
+                     "(3) AngelOne not connected.")
+        else:
+            st.success(f"✅ Options chain loaded ({opt_rows} strikes) from {opt_src}")
+
     # Detect patterns
     patterns = []
     if candle_df is not None and not candle_df.empty:
