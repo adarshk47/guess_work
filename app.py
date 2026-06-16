@@ -77,7 +77,7 @@ try:
     from modules.oi_analyzer import (
         compute_delta_oi, build_oi_timeframe_table,
         get_oi_arrow_annotations, build_strike_volume_table,
-        get_most_traded_strikes,
+        get_most_traded_strikes, get_oi_snapshot, store_oi_snapshot,
     )
     from modules.greeks_analyzer import analyze_greeks, build_greeks_trend_table, get_gamma_exposure
     from modules.paper_trader import (
@@ -741,10 +741,13 @@ def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None
         st.rerun()
 
 
-def render_oi_table_tab(candle_data_by_tf: dict, options_df: pd.DataFrame, spot: float):
+def render_oi_table_tab(candle_data_by_tf: dict, options_df: pd.DataFrame, spot: float,
+                        expiry_str: str = ""):
     st.markdown("### 📊 OI Difference Table – Trend Direction by Timeframe")
+    if expiry_str and expiry_str != "---":
+        st.caption(f"Expiry: **{expiry_str}** (NIFTY weekly)")
     if options_df is None or options_df.empty:
-        st.warning("Options data unavailable")
+        st.warning("⚠️ Options chain unavailable. AngelOne se connect karo ya thodi der baad try karo.")
         return
 
     oi_table = build_oi_timeframe_table(candle_data_by_tf, options_df, spot)
@@ -1038,11 +1041,14 @@ def main():
         except Exception as e:
             st.warning(f"Pattern detection error: {e}")
 
-    # OI analysis
+    # OI analysis — store a fresh snapshot every refresh so timeframe deltas build up
     oi_delta = {}
     oi_annotations = []
     if options_df is not None and not options_df.empty:
         try:
+            snapshot = get_oi_snapshot()
+            if snapshot:
+                store_oi_snapshot(snapshot)
             oi_delta = compute_delta_oi(options_df, ltp)
             oi_annotations = get_oi_arrow_annotations(candle_df, options_df, ltp, selected_tf)
         except Exception:
@@ -1085,7 +1091,7 @@ def main():
         render_paper_trade_tab(patterns, ltp, candle_df, options_df)
 
     with tab4:
-        render_oi_table_tab(candle_data_by_tf, options_df, ltp)
+        render_oi_table_tab(candle_data_by_tf, options_df, ltp, expiry_str)
 
     with tab5:
         render_greeks_tab(options_df, ltp)

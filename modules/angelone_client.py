@@ -163,11 +163,19 @@ def is_market_open() -> bool:
     return market_open <= now <= market_close
 
 
+def _next_thursday(ref_date) -> "date":
+    """Return the nearest upcoming Thursday on or after ref_date."""
+    from datetime import date as date_type
+    days_ahead = (3 - ref_date.weekday()) % 7  # Thursday = weekday 3
+    return ref_date + timedelta(days=days_ahead)
+
+
 def get_next_weekly_expiry() -> datetime:
     """
-    Get the next weekly NIFTY expiry from the NFO scrip master (authoritative
-    list of all listed option expiries). Picks the nearest upcoming expiry.
-    Falls back to the cached value, else returns None so the UI shows '---'.
+    Get the next weekly NIFTY expiry (every Thursday).
+    Primary: NFO scrip master (authoritative list).
+    Fallback 1: last known expiry cached in session_state.
+    Fallback 2: compute next Thursday directly — no network call needed.
     """
     now = datetime.now(IST)
     today = now.date()
@@ -189,15 +197,23 @@ def get_next_weekly_expiry() -> datetime:
     except Exception as e:
         logger.debug(f"Expiry fetch from scrip master failed: {e}")
 
-    # Fallback: use last known expiry from session_state if still valid
+    # Fallback 1: use last known expiry from session_state if still valid
     cached = st.session_state.get("_last_known_expiry")
     if cached is not None:
         cached_date = cached.date() if hasattr(cached, "date") else cached
         if cached_date >= today:
             return cached
 
-    # No data available — return None so UI can show "---"
-    return None
+    # Fallback 2: compute next Thursday directly (NIFTY weekly expiry day)
+    thursday = _next_thursday(today)
+    # If today is Thursday and market is closed, roll to next Thursday
+    if thursday == today:
+        mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if now > mkt_close:
+            thursday = today + timedelta(days=7)
+    expiry_dt = datetime.combine(thursday, datetime.min.time()).replace(tzinfo=IST)
+    st.session_state["_last_known_expiry"] = expiry_dt
+    return expiry_dt
 
 
 def get_expiry_string(expiry_dt) -> str:
