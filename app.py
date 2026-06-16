@@ -636,7 +636,8 @@ def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None
                 # is tracked in premium terms.
                 option_type = "CE" if pat.signal == "BUY" else "PE"
                 opt_prem, opt_delta = get_atm_option_quote(
-                    options_df, effective_spot, option_type)
+                    options_df, effective_spot, option_type,
+                    idx_entry=float(pat.entry))
                 add_paper_trade(pat, pat_name, effective_spot,
                                 source="AUTO", simulated=sim, trade_time=trade_time,
                                 option_premium=opt_prem, option_delta=opt_delta)

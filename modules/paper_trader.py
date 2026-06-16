@@ -33,11 +33,17 @@ def init_paper_trades():
 DEFAULT_ATM_DELTA = 0.5
 
 
-def get_atm_option_quote(options_df, spot_price: float, option_type: str):
+def get_atm_option_quote(options_df, spot_price: float, option_type: str,
+                         idx_entry: float = None):
     """
     Look up the ATM option's premium (LTP) and delta from the options chain.
     option_type is 'CE' or 'PE'. Returns (premium, delta); (0.0, 0.0) if the
     chain is unavailable.
+
+    If idx_entry is given (the index level when the pattern formed), the
+    current ATM premium is back-adjusted to estimate what it was at that time:
+        adjusted_prem = current_prem + delta × (idx_entry − current_spot)
+    This removes the bias of using today's live LTP for all historical patterns.
     """
     try:
         if options_df is None or options_df.empty or not spot_price:
@@ -48,6 +54,10 @@ def get_atm_option_quote(options_df, spot_price: float, option_type: str):
         opt = option_type.lower()
         prem = float(row.get(f"{opt}_ltp", 0) or 0)
         delta = float(row.get(f"{opt}_delta", 0) or 0)
+        # Adjust for the spot level at pattern formation time
+        if idx_entry is not None and spot_price and delta and prem:
+            prem = prem + delta * (idx_entry - spot_price)
+            prem = max(round(prem, 2), 0.05)
         return prem, delta
     except Exception:
         return 0.0, 0.0
