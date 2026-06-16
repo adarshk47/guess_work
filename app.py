@@ -745,7 +745,9 @@ def render_oi_table_tab(candle_data_by_tf: dict, options_df: pd.DataFrame, spot:
                         expiry_str: str = ""):
     st.markdown("### 📊 OI Difference Table – Trend Direction by Timeframe")
     if expiry_str and expiry_str != "---":
-        st.caption(f"Expiry: **{expiry_str}** (NIFTY weekly)")
+        src = st.session_state.get("_expiry_source", "")
+        src_txt = f" · source: {src}" if src else ""
+        st.caption(f"Expiry: **{expiry_str}**{src_txt}")
     if options_df is None or options_df.empty:
         st.warning("⚠️ Options chain unavailable. AngelOne se connect karo ya thodi der baad try karo.")
         return

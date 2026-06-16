@@ -163,56 +163,112 @@ def is_market_open() -> bool:
     return market_open <= now <= market_close
 
 
+import re as _re
+
+
+@st.cache_data(ttl=1800)
+def _fetch_expiries_from_api() -> list:
+    """
+    Fetch real NIFTY option expiry dates from AngelOne via searchScrip.
+    Parses expiry from the trading symbol name (e.g. NIFTY19JUN26C24000).
+    Returns sorted list of date objects; empty list if API unavailable.
+    """
+    obj = get_client()
+    if obj is None:
+        return []
+    try:
+        result = obj.searchScrip("NFO", "NIFTY")
+        if not (result and result.get("status") and result.get("data")):
+            return []
+        expiry_dates = set()
+        for item in result["data"]:
+            sym = item.get("tradingsymbol", "")
+            # Two common formats in NSE:
+            #   NIFTY19JUN26C24000  (2-digit year)
+            #   NIFTY19JUN2026CE24000 (4-digit year)
+            m = _re.match(r"NIFTY(\d{2})([A-Z]{3})(\d{2,4})[CP]", sym)
+            if m:
+                day, mon, yr = m.groups()
+                yr = yr if len(yr) == 4 else f"20{yr}"
+                try:
+                    from datetime import date as _date
+                    expiry_dates.add(
+                        datetime.strptime(f"{day}{mon}{yr}", "%d%b%Y").date()
+                    )
+                except Exception:
+                    pass
+        return sorted(expiry_dates)
+    except Exception as e:
+        logger.debug(f"searchScrip expiry fetch failed: {e}")
+        return []
+
+
 def _next_thursday(ref_date) -> "date":
     """Return the nearest upcoming Thursday on or after ref_date."""
-    from datetime import date as date_type
     days_ahead = (3 - ref_date.weekday()) % 7  # Thursday = weekday 3
-    return ref_date + timedelta(days=days_ahead)
+    return ref_date + timedelta(days=days_ahead if days_ahead > 0 else 7)
 
 
 def get_next_weekly_expiry() -> datetime:
     """
-    Get the next weekly NIFTY expiry (every Thursday).
-    Primary: NFO scrip master (authoritative list).
-    Fallback 1: last known expiry cached in session_state.
-    Fallback 2: compute next Thursday directly — no network call needed.
+    Get the next NIFTY option expiry.
+
+    Priority order:
+    1. AngelOne searchScrip API (authenticated, exact expiry list from exchange)
+    2. Public NFO scrip master URL
+    3. Last known expiry cached in session_state
+    4. Next Thursday as last resort (displayed with a warning — may be wrong)
     """
     now = datetime.now(IST)
     today = now.date()
+    mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-    # Primary source: the public NFO scrip master (no auth needed, reliable)
+    def _pick(expiry_dates):
+        future = sorted(d for d in expiry_dates if d >= today)
+        if not future:
+            return None
+        nearest = future[0]
+        if nearest == today and now > mkt_close and len(future) > 1:
+            nearest = future[1]
+        return nearest
+
+    # ── 1. AngelOne authenticated API ────────────────────────────────────────
     try:
-        expiries = _load_nifty_expiries()
-        future = sorted(d for d in expiries if d >= today)
-        if future:
-            nearest = future[0]
-            # If today is expiry and the session has closed, roll to the next
-            if nearest == today:
-                mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-                if now > mkt_close and len(future) > 1:
-                    nearest = future[1]
-            expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
-            st.session_state["_last_known_expiry"] = expiry_dt
-            return expiry_dt
+        api_expiries = _fetch_expiries_from_api()
+        if api_expiries:
+            nearest = _pick(api_expiries)
+            if nearest:
+                expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
+                st.session_state["_last_known_expiry"] = expiry_dt
+                st.session_state["_expiry_source"] = "AngelOne API"
+                return expiry_dt
     except Exception as e:
-        logger.debug(f"Expiry fetch from scrip master failed: {e}")
+        logger.debug(f"API expiry pick failed: {e}")
 
-    # Fallback 1: use last known expiry from session_state if still valid
+    # ── 2. Public NFO scrip master ────────────────────────────────────────────
+    try:
+        master_expiries = _load_nifty_expiries()
+        if master_expiries:
+            nearest = _pick(master_expiries)
+            if nearest:
+                expiry_dt = datetime.combine(nearest, datetime.min.time()).replace(tzinfo=IST)
+                st.session_state["_last_known_expiry"] = expiry_dt
+                st.session_state["_expiry_source"] = "scrip master"
+                return expiry_dt
+    except Exception as e:
+        logger.debug(f"Scrip master expiry pick failed: {e}")
+
+    # ── 3. Cached from last successful fetch ──────────────────────────────────
     cached = st.session_state.get("_last_known_expiry")
     if cached is not None:
         cached_date = cached.date() if hasattr(cached, "date") else cached
         if cached_date >= today:
             return cached
 
-    # Fallback 2: compute next Thursday directly (NIFTY weekly expiry day)
+    # ── 4. Last resort: next Thursday (may not match actual NSE expiry) ───────
     thursday = _next_thursday(today)
-    # If today is Thursday and market is closed, roll to next Thursday
-    if thursday == today:
-        mkt_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        if now > mkt_close:
-            thursday = today + timedelta(days=7)
     expiry_dt = datetime.combine(thursday, datetime.min.time()).replace(tzinfo=IST)
-    st.session_state["_last_known_expiry"] = expiry_dt
+    st.session_state["_expiry_source"] = "estimated (Thursday)"
     return expiry_dt
 
 
