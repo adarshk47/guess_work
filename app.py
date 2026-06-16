@@ -84,6 +84,7 @@ try:
         is_market_open as paper_market_open,
         add_paper_trade, update_paper_trades, get_trades_df,
         get_paper_trade_summary, should_add_new_trade, clear_all_trades,
+        get_atm_option_quote,
     )
     MODULES_OK = True
 except Exception as e:
@@ -594,8 +595,11 @@ def render_strike_volume_tab(options_df: pd.DataFrame, spot: float, candle_data_
         st.info("Loading strike data...")
 
 
-def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None):
-    st.markdown("### 📝 Paper Trading – Auto Signals")
+def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None,
+                           options_df: pd.DataFrame = None):
+    st.markdown("### 📝 Paper Trading – Auto Signals (Buy-side Options)")
+    st.caption("Sirf option **BUY** — bullish pe CE, bearish pe PE. "
+               "Entry / SL / Target sab **option premium (₹)** mein, index level mein nahi.")
     market_open = is_market_open()
     effective_spot = spot if spot and spot > 0 else st.session_state.get("_last_ltp", 22000.0)
 
@@ -627,8 +631,15 @@ def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None
                             trade_time = pd.Timestamp(candle_df["timestamp"].iloc[idx]).to_pydatetime()
                         except Exception:
                             trade_time = None
+                # Buy CE for a bullish signal, PE for a bearish one — then pull
+                # that option's live premium + delta from the chain so the trade
+                # is tracked in premium terms.
+                option_type = "CE" if pat.signal == "BUY" else "PE"
+                opt_prem, opt_delta = get_atm_option_quote(
+                    options_df, effective_spot, option_type)
                 add_paper_trade(pat, pat_name, effective_spot,
-                                source="AUTO", simulated=sim, trade_time=trade_time)
+                                source="AUTO", simulated=sim, trade_time=trade_time,
+                                option_premium=opt_prem, option_delta=opt_delta)
 
     # Update open trade statuses
     update_paper_trades(spot)
@@ -657,7 +668,10 @@ def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None
     st.markdown("#### 📑 Trade Details")
     for trade in reversed(st.session_state["paper_trades"][-12:]):
         status = trade["status"]
-        sig_color = "#00ff88" if trade["signal"] == "BUY" else "#ff4444"
+        # Always a BUY; colour the card by the underlying bias (CE=bullish/green,
+        # PE=bearish/red) so direction is still readable at a glance.
+        is_bullish = trade.get("direction", "BUY") == "BUY"
+        sig_color = "#00ff88" if is_bullish else "#ff4444"
         if status == "PROFIT":
             st_color, st_icon = "#00ff88", "✅ TARGET HIT"
         elif status == "LOSS":
@@ -666,16 +680,16 @@ def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None
             st_color, st_icon = "#aaaaff", "⏳ OPEN"
         exit_info = ""
         if trade["exit_price"] is not None:
-            exit_info = (f"Exit: <b style='color:#fff;'>{trade['exit_price']}</b> "
+            exit_info = (f"Exit: <b style='color:#fff;'>₹{trade['exit_price']}</b> "
                          f"@ {trade['exit_time']} &nbsp;|&nbsp; "
-                         f"P&L: <b style='color:{st_color};'>{trade['pnl']:+.2f} "
+                         f"P&L: <b style='color:{st_color};'>₹{trade['pnl']:+.2f} "
                          f"({trade['pnl_pct']:+.2f}%)</b>")
         src_badge = "SIM" if trade.get("source") == "SIM" else "LIVE"
         st.markdown(f"""
         <div style="background:#1e2130;border-left:4px solid {st_color};
                     padding:10px 14px;border-radius:0 6px 6px 0;margin-bottom:8px;">
             <div style="display:flex;justify-content:space-between;">
-                <span><b style="color:{sig_color};">{trade['signal']}</b>
+                <span><b style="color:{sig_color};">BUY</b>
                     &nbsp;<b style="color:#fff;">{trade['option']}</b>
                     &nbsp;<span style="color:#888;font-size:11px;">[{src_badge}]</span></span>
                 <span style="color:{st_color};font-weight:bold;">{st_icon}</span>
@@ -686,9 +700,9 @@ def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None
                 {trade['time']} {trade['date']}
             </div>
             <div style="font-size:13px;color:#ccc;margin-top:6px;">
-                Entry: <b style="color:#fff;">{trade['entry']}</b> &nbsp;|&nbsp;
-                SL: <b style="color:#ff8888;">{trade['stop_loss']}</b> &nbsp;|&nbsp;
-                Target: <b style="color:#88ff88;">{trade['target']}</b> &nbsp;|&nbsp;
+                Entry: <b style="color:#fff;">₹{trade['entry']}</b> &nbsp;|&nbsp;
+                SL: <b style="color:#ff8888;">₹{trade['stop_loss']}</b> &nbsp;|&nbsp;
+                Target: <b style="color:#88ff88;">₹{trade['target']}</b> &nbsp;|&nbsp;
                 R:R <b style="color:#ffd700;">1:{trade['rr']}</b>
             </div>
             <div style="font-size:13px;color:#ccc;margin-top:4px;">{exit_info}</div>
@@ -710,8 +724,15 @@ def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None
     display_cols = ["id", "time", "pattern", "signal", "option", "entry", "stop_loss",
                     "target", "rr", "status", "exit_price", "exit_time", "pnl", "confidence"]
     available = [c for c in display_cols if c in df.columns]
-    styled = style_cells(df[available].style, style_status,
-                         ["status"] if "status" in available else [])
+    # Premium-space columns get a ₹ label so it's clear these are option prices,
+    # not index levels.
+    premium_labels = {
+        "entry": "entry ₹", "stop_loss": "SL ₹", "target": "target ₹",
+        "exit_price": "exit ₹", "pnl": "P&L ₹",
+    }
+    table_df = df[available].rename(columns=premium_labels)
+    status_subset = ["status"] if "status" in table_df.columns else []
+    styled = style_cells(table_df.style, style_status, status_subset)
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     if st.button("🗑️ Clear Paper Trades", key="clear_paper"):
@@ -1060,7 +1081,7 @@ def main():
         render_strike_volume_tab(options_df, ltp, candle_data_by_tf)
 
     with tab3:
-        render_paper_trade_tab(patterns, ltp, candle_df)
+        render_paper_trade_tab(patterns, ltp, candle_df, options_df)
 
     with tab4:
         render_oi_table_tab(candle_data_by_tf, options_df, ltp)
