@@ -168,9 +168,12 @@ def _candidate_expiry_strings(ref_date=None) -> list:
     Generate candidate NIFTY expiry strings to probe (next 6 Thursdays).
     Returns list of strings in '19JUN2026' format.
     """
-    from datetime import date as _date
     today = ref_date or datetime.now(IST).date()
     candidates = []
+    # If today IS the Thursday expiry (and still tradable), it must be probed
+    # first — otherwise the off-by-one below would skip straight to next week.
+    if today.weekday() == 3:
+        candidates.append(today.strftime("%d%b%Y").upper())
     d = today
     for _ in range(6):
         days_ahead = (3 - d.weekday()) % 7  # next Thursday
@@ -194,7 +197,11 @@ def _find_valid_nifty_expiry_via_api() -> str:
     for expiry_str in _candidate_expiry_strings():
         try:
             gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
-            if gr and gr.get("status") and gr.get("data") and len(gr["data"]) > 5:
+            # A real expiry returns at least a handful of strikes; an invalid
+            # one returns an empty/zero-length list. ">5" was too strict and
+            # could reject a thin but valid response — any non-empty data is
+            # proof the expiry string itself is valid.
+            if gr and gr.get("status") and gr.get("data"):
                 logger.info(f"Valid NIFTY expiry confirmed via optionGreek: {expiry_str}")
                 return expiry_str
         except Exception:
@@ -456,7 +463,14 @@ def _load_nifty_master_raw() -> pd.DataFrame:
     """
     import requests
 
-    resp = requests.get(_SCRIP_MASTER_URL, timeout=20)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+    }
+    resp = requests.get(_SCRIP_MASTER_URL, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
 
@@ -687,6 +701,21 @@ def get_options_diagnostics(expiry_str: str = None) -> dict:
             diag["optionGreek"] = f"FAIL — {msg}"
     except Exception as e:
         diag["optionGreek"] = f"ERROR — {type(e).__name__}: {e}"
+
+    # 1b) per-candidate expiry probe — shows exactly which Thursday (if any)
+    # AngelOne actually confirms, and what each attempt returned/raised.
+    probe = {}
+    for cand in _candidate_expiry_strings():
+        try:
+            gr = obj.optionGreek({"name": "NIFTY", "expirydate": cand})
+            if gr and gr.get("status"):
+                probe[cand] = f"OK — {len(gr.get('data') or [])} rows"
+            else:
+                msg = gr.get("message") if isinstance(gr, dict) else str(gr)
+                probe[cand] = f"FAIL — {msg}"
+        except Exception as e:
+            probe[cand] = f"ERROR — {type(e).__name__}: {e}"
+    diag["expiry_candidate_probe"] = probe
 
     # 2) scrip master URL (public) — token source
     try:
