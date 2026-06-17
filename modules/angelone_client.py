@@ -654,6 +654,69 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
         return st.session_state.get("_last_options_df", pd.DataFrame())
 
 
+def get_options_diagnostics(expiry_str: str = None) -> dict:
+    """
+    Run each option-data step individually and report what happened.
+    Used by the UI debug panel to pinpoint why the options chain is empty.
+    Returns a dict of human-readable status strings.
+    """
+    diag = {}
+    obj = get_client()
+    diag["connected"] = obj is not None
+    diag["last_error"] = get_last_error() or "—"
+    if obj is None:
+        diag["summary"] = "NOT connected to AngelOne — add secrets and Connect."
+        return diag
+
+    if expiry_str is None or expiry_str == "---":
+        try:
+            expiry_str = get_expiry_string(get_next_weekly_expiry())
+        except Exception:
+            expiry_str = "?"
+    diag["expiry"] = expiry_str
+    diag["expiry_source"] = st.session_state.get("_expiry_source", "?")
+
+    # 1) optionGreek — greeks for all strikes (only needs expiry string)
+    try:
+        gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
+        if gr and gr.get("status"):
+            n = len(gr.get("data") or [])
+            diag["optionGreek"] = f"OK — {n} rows"
+        else:
+            msg = gr.get("message") if isinstance(gr, dict) else str(gr)
+            diag["optionGreek"] = f"FAIL — {msg}"
+    except Exception as e:
+        diag["optionGreek"] = f"ERROR — {type(e).__name__}: {e}"
+
+    # 2) scrip master URL (public) — token source
+    try:
+        raw = _load_nifty_master_raw()
+        diag["scrip_master_url"] = f"OK — {len(raw)} NIFTY option rows" if not raw.empty \
+            else "EMPTY — URL reachable but no rows parsed"
+    except Exception as e:
+        diag["scrip_master_url"] = f"ERROR — {type(e).__name__}: {e}"
+
+    # 3) searchScrip API — alternate token source
+    try:
+        res = obj.searchScrip("NFO", "NIFTY")
+        if res and res.get("status"):
+            diag["searchScrip"] = f"OK — {len(res.get('data') or [])} symbols"
+        else:
+            diag["searchScrip"] = f"FAIL — {res.get('message') if isinstance(res, dict) else res}"
+    except Exception as e:
+        diag["searchScrip"] = f"ERROR — {type(e).__name__}: {e}"
+
+    # 4) final assembled chain
+    df = fetch_options_chain(expiry_str)
+    diag["chain_rows"] = 0 if df is None or df.empty else len(df)
+    if diag["chain_rows"]:
+        oi_total = int(df["ce_oi"].sum() + df["pe_oi"].sum())
+        diag["chain_has_oi"] = oi_total > 0
+        diag["chain_has_greeks"] = bool((df["ce_delta"].abs().sum() +
+                                         df["pe_delta"].abs().sum()) > 0)
+    return diag
+
+
 def get_atm_strike(spot_price: float, step: int = 50) -> int:
     """Round spot price to nearest ATM strike (multiple of step)."""
     return int(round(spot_price / step) * step)

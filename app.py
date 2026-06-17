@@ -72,12 +72,14 @@ try:
         get_next_weekly_expiry, get_expiry_string, get_expiry_countdown,
         is_market_open, get_atm_strike, get_strike_range, INTERVAL_MAP,
         is_connected, get_data_source, get_client, get_last_error,
+        get_options_diagnostics,
     )
     from modules.pattern_detector import detect_all_patterns
     from modules.oi_analyzer import (
         compute_delta_oi, build_oi_timeframe_table,
         get_oi_arrow_annotations, build_strike_volume_table,
         get_most_traded_strikes, get_oi_snapshot, store_oi_snapshot,
+        analyze_oi_trend, oi_support_resistance,
     )
     from modules.greeks_analyzer import analyze_greeks, build_greeks_trend_table, get_gamma_exposure
     from modules.paper_trader import (
@@ -603,9 +605,18 @@ def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None
     market_open = is_market_open()
     effective_spot = spot if spot and spot > 0 else st.session_state.get("_last_ltp", 22000.0)
 
+    # Tell the user whether premiums are REAL (from chain) or ESTIMATED (fallback)
+    chain_ok = (options_df is not None and not options_df.empty
+                and (options_df.get("ce_ltp", pd.Series(dtype=float)).fillna(0).abs().sum()
+                     + options_df.get("pe_ltp", pd.Series(dtype=float)).fillna(0).abs().sum()) > 0)
+    if chain_ok:
+        st.success("💹 Premium source: **Live option chain** (real CE/PE LTP + delta)")
+    else:
+        st.warning("⚠️ Premium source: **Estimated** (option chain unavailable). "
+                   "Real premium ke liye chain load hona chahiye — upar 'Data Status' dekho.")
+
     if not market_open:
-        st.warning("🔴 Market Closed — showing **simulation** results based on chart patterns "
-                   "detected from last session data.")
+        st.info("🔴 Market Closed — **simulation** results based on patterns from last session.")
 
     # Auto-add trades from patterns
     # Live mode: OPEN trades tracked in real-time
@@ -739,6 +750,69 @@ def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None
     if st.button("🗑️ Clear Paper Trades", key="clear_paper"):
         clear_all_trades()
         st.rerun()
+
+
+def render_oi_trend_tab(options_df: pd.DataFrame, spot: float):
+    st.markdown("### 📈 OI Trend – Market kis side jaa raha hai")
+    st.caption("CE OI badhe = resistance (BEARISH) · PE OI badhe = support (BULLISH). "
+               "Live change app market hours mein chalti rahe to banta hai.")
+
+    if options_df is None or options_df.empty:
+        st.warning("⚠️ Options chain unavailable — OI trend nahi bana sakte.")
+        return
+
+    # ── Live 15-min / 30-min OI change (needs accumulated history) ────────────
+    t15 = analyze_oi_trend(15)
+    t30 = analyze_oi_trend(30)
+
+    cols = st.columns(2)
+    for col, t, label in ((cols[0], t15, "Last 15 min"), (cols[1], t30, "Last 30 min")):
+        with col:
+            if not t.get("available"):
+                st.info(f"**{label}** — abhi enough history nahi. "
+                        "Auto-refresh ON rakho market hours mein, data build hoga.")
+                continue
+            c = t["color"]
+            st.markdown(f"""
+            <div style="background:#1e2130;border:2px solid {c};border-radius:10px;
+                        padding:14px 16px;text-align:center;">
+                <div style="color:#888;font-size:12px;">{label} (≈{t['span_minutes']}m)</div>
+                <div style="font-size:26px;font-weight:bold;color:{c};">
+                    {t['arrow']} {t['verdict']}</div>
+                <div style="font-size:13px;color:#ccc;margin-top:6px;">
+                    CE OIΔ: <b style="color:#ff8888;">{t['ce_change']:+,}</b> &nbsp;|&nbsp;
+                    PE OIΔ: <b style="color:#88ff88;">{t['pe_change']:+,}</b>
+                </div>
+                <div style="font-size:12px;color:#888;margin-top:2px;">
+                    Net (PE−CE): <b style="color:{c};">{t['net']:+,}</b></div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("<hr style='border-color:#2d3250;margin:14px 0;'>", unsafe_allow_html=True)
+
+    # ── Current OI distribution (always available from chain snapshot) ─────────
+    sr = oi_support_resistance(options_df, spot, n=3)
+    if not sr.get("available"):
+        return
+
+    c = sr["color"]
+    st.markdown(f"""
+    <div style="background:#1e2130;border-radius:8px;padding:12px 16px;margin-bottom:12px;">
+        <b>OI Distribution Bias:</b>
+        <span style="color:{c};font-size:20px;font-weight:bold;"> {sr['bias']}</span>
+        &nbsp;|&nbsp; PCR: <b style="color:#ffd700;">{sr['pcr']}</b>
+        &nbsp;|&nbsp; Total CE OI: <b style="color:#ff8888;">{sr['total_ce_oi']:,}</b>
+        &nbsp;|&nbsp; Total PE OI: <b style="color:#88ff88;">{sr['total_pe_oi']:,}</b>
+    </div>""", unsafe_allow_html=True)
+
+    sup_col, res_col = st.columns(2)
+    with sup_col:
+        st.markdown("#### 🟢 Support (max PE OI)")
+        for s in sr["supports"]:
+            st.markdown(f"- **{int(s['strike'])}** — PE OI {int(s['pe_oi']):,}")
+    with res_col:
+        st.markdown("#### 🔴 Resistance (max CE OI)")
+        for r in sr["resistances"]:
+            st.markdown(f"- **{int(r['strike'])}** — CE OI {int(r['ce_oi']):,}")
 
 
 def render_oi_table_tab(candle_data_by_tf: dict, options_df: pd.DataFrame, spot: float,
@@ -1035,21 +1109,24 @@ def main():
     expiry_str = get_expiry_string(expiry_dt)
     options_df = fetch_options_chain(expiry_str)
 
-    # ── Debug expander (always visible so user can diagnose issues) ───────────
+    # ── Debug expander (auto-opens when the chain is empty so we can diagnose) ─
     expiry_src = st.session_state.get("_expiry_source", "unknown")
-    opt_src = st.session_state.get("_option_master_source", "scrip master")
     opt_rows = len(options_df) if options_df is not None and not options_df.empty else 0
-    with st.expander(f"🔍 Data Status — Expiry: {expiry_str} | Options strikes: {opt_rows}", expanded=(opt_rows == 0)):
+    with st.expander(f"🔍 Data Status — Expiry: {expiry_str} | Option strikes: {opt_rows}",
+                     expanded=(opt_rows == 0)):
         c1, c2, c3 = st.columns(3)
         c1.metric("Expiry", expiry_str)
         c2.metric("Expiry Source", expiry_src)
         c3.metric("Option Strikes", opt_rows)
         if opt_rows == 0:
-            st.error("⚠️ Options chain empty — OI / Greeks / Strike tabs will show no data. "
-                     "Possible causes: (1) wrong expiry, (2) scrip master + API both failed, "
-                     "(3) AngelOne not connected.")
+            st.error("⚠️ Options chain empty — OI / Greeks / Strike tabs blank ho rahe hain.")
         else:
-            st.success(f"✅ Options chain loaded ({opt_rows} strikes) from {opt_src}")
+            st.success(f"✅ Options chain loaded — {opt_rows} strikes")
+        # Run per-step diagnostics so we can see exactly which API fails
+        if st.button("🩺 Run full diagnostics", key="run_diag") or opt_rows == 0:
+            with st.spinner("Checking each AngelOne API step…"):
+                diag = get_options_diagnostics(expiry_str)
+            st.json(diag)
 
     # Detect patterns
     patterns = []
@@ -1090,10 +1167,11 @@ def main():
         })
 
     # ── Tabs ─────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📋 Recommendations",
         "🎯 Strike Volume",
         "📝 Paper Trade",
+        "📈 OI Trend",
         "📊 OI Table",
         "🔢 Greeks",
         "🏆 Best Trade",
@@ -1109,12 +1187,15 @@ def main():
         render_paper_trade_tab(patterns, ltp, candle_df, options_df)
 
     with tab4:
-        render_oi_table_tab(candle_data_by_tf, options_df, ltp, expiry_str)
+        render_oi_trend_tab(options_df, ltp)
 
     with tab5:
-        render_greeks_tab(options_df, ltp)
+        render_oi_table_tab(candle_data_by_tf, options_df, ltp, expiry_str)
 
     with tab6:
+        render_greeks_tab(options_df, ltp)
+
+    with tab7:
         render_best_trade_tab(patterns, options_df, ltp, oi_delta, greeks_result)
 
     # ── Auto-refresh bar at bottom ─────────────────────────────────────────

@@ -196,6 +196,97 @@ def get_all_timeframe_deltas() -> dict:
     return results
 
 
+# ─── Directional OI Trend (which side is OI building) ─────────────────────────
+
+def analyze_oi_trend(minutes: int) -> dict:
+    """
+    Compare CE vs PE OI change over the last `minutes` using the standard
+    Indian-market convention:
+        • PE OI building (vs CE)  → put writers / support  → BULLISH
+        • CE OI building (vs PE)  → call writers / resistance → BEARISH
+    Returns a dict; 'available' is False when there isn't enough history yet.
+    """
+    history = st.session_state.get("oi_history", [])
+    now = datetime.now(IST)
+    if len(history) < 2:
+        return {"available": False, "minutes": minutes}
+
+    cutoff = now - timedelta(minutes=minutes)
+    past_entries = [e for e in history if e["timestamp"] <= cutoff]
+    past_entry = past_entries[-1] if past_entries else history[0]
+    past_snap = past_entry["snapshot"]
+    curr_snap = history[-1]["snapshot"]
+
+    ce_chg = pe_chg = 0
+    for strike, cur in curr_snap.items():
+        if strike in past_snap:
+            ce_chg += cur["ce_oi"] - past_snap[strike]["ce_oi"]
+            pe_chg += cur["pe_oi"] - past_snap[strike]["pe_oi"]
+
+    net = pe_chg - ce_chg
+    threshold = 30000
+    if net > threshold:
+        verdict, color, arrow = "BULLISH", "#00ff88", "↑"
+    elif net < -threshold:
+        verdict, color, arrow = "BEARISH", "#ff4444", "↓"
+    else:
+        verdict, color, arrow = "NEUTRAL", "#ffd700", "→"
+
+    span_sec = (history[-1]["timestamp"] - past_entry["timestamp"]).total_seconds()
+    return {
+        "available": True,
+        "minutes": minutes,
+        "ce_change": int(ce_chg),
+        "pe_change": int(pe_chg),
+        "net": int(net),
+        "verdict": verdict,
+        "color": color,
+        "arrow": arrow,
+        "span_minutes": round(span_sec / 60, 1),
+    }
+
+
+def oi_support_resistance(options_df: pd.DataFrame, spot: float, n: int = 3) -> dict:
+    """
+    Current OI distribution snapshot:
+      • highest PE OI strikes  → support zones
+      • highest CE OI strikes  → resistance zones
+      • PCR and total CE/PE OI
+    Works off the live (or last-session) chain — no time history needed.
+    """
+    if options_df is None or options_df.empty:
+        return {"available": False}
+
+    df = options_df.copy()
+    total_ce = int(df["ce_oi"].sum())
+    total_pe = int(df["pe_oi"].sum())
+    pcr = round(total_pe / max(total_ce, 1), 2)
+
+    supports = (df.nlargest(n, "pe_oi")[["strike", "pe_oi"]]
+                .to_dict("records")) if "pe_oi" in df else []
+    resistances = (df.nlargest(n, "ce_oi")[["strike", "ce_oi"]]
+                   .to_dict("records")) if "ce_oi" in df else []
+
+    # Distribution bias: bigger PE wall below = support (bullish), etc.
+    if pcr > 1.2:
+        bias, color = "BULLISH", "#00ff88"
+    elif pcr < 0.8:
+        bias, color = "BEARISH", "#ff4444"
+    else:
+        bias, color = "NEUTRAL", "#ffd700"
+
+    return {
+        "available": True,
+        "total_ce_oi": total_ce,
+        "total_pe_oi": total_pe,
+        "pcr": pcr,
+        "bias": bias,
+        "color": color,
+        "supports": supports,       # max PE OI
+        "resistances": resistances, # max CE OI
+    }
+
+
 # ─── OI Table Builder ─────────────────────────────────────────────────────────
 
 def build_oi_timeframe_table(candle_data_by_tf: dict, options_df: pd.DataFrame, spot: float) -> pd.DataFrame:
