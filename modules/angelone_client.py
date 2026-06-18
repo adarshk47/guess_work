@@ -165,18 +165,19 @@ def is_market_open() -> bool:
 
 def _candidate_expiry_strings(ref_date=None) -> list:
     """
-    Generate candidate NIFTY expiry strings to probe (next 6 Thursdays).
+    Generate candidate NIFTY expiry strings to probe (next 6 Tuesdays — NSE
+    moved the weekly NIFTY expiry day from Thursday to Tuesday).
     Returns list of strings in '19JUN2026' format.
     """
     today = ref_date or datetime.now(IST).date()
     candidates = []
-    # If today IS the Thursday expiry (and still tradable), it must be probed
+    # If today IS the Tuesday expiry (and still tradable), it must be probed
     # first — otherwise the off-by-one below would skip straight to next week.
-    if today.weekday() == 3:
+    if today.weekday() == 1:
         candidates.append(today.strftime("%d%b%Y").upper())
     d = today
     for _ in range(6):
-        days_ahead = (3 - d.weekday()) % 7  # next Thursday
+        days_ahead = (1 - d.weekday()) % 7  # next Tuesday
         if days_ahead == 0:
             days_ahead = 7
         d = d + timedelta(days=days_ahead)
@@ -218,7 +219,7 @@ def get_next_weekly_expiry() -> datetime:
     2. AngelOne searchScrip symbol parsing
     3. Public NFO scrip master URL
     4. Session-state cache from last successful fetch
-    5. Next Thursday (last resort, may be wrong)
+    5. Next Tuesday (last resort, may be wrong)
     """
     now = datetime.now(IST)
     today = now.date()
@@ -282,13 +283,13 @@ def get_next_weekly_expiry() -> datetime:
         if cached_date >= today:
             return cached
 
-    # ── 5. Next Thursday (absolute last resort) ───────────────────────────────
-    days_ahead = (3 - today.weekday()) % 7
+    # ── 5. Next Tuesday (absolute last resort) ────────────────────────────────
+    days_ahead = (1 - today.weekday()) % 7
     if days_ahead == 0:
         days_ahead = 7
-    thursday = today + timedelta(days=days_ahead)
-    expiry_dt = datetime.combine(thursday, datetime.min.time()).replace(tzinfo=IST)
-    st.session_state["_expiry_source"] = "estimated Thursday"
+    tuesday = today + timedelta(days=days_ahead)
+    expiry_dt = datetime.combine(tuesday, datetime.min.time()).replace(tzinfo=IST)
+    st.session_state["_expiry_source"] = "estimated Tuesday"
     return expiry_dt
 
 
@@ -702,7 +703,7 @@ def get_options_diagnostics(expiry_str: str = None) -> dict:
     except Exception as e:
         diag["optionGreek"] = f"ERROR — {type(e).__name__}: {e}"
 
-    # 1b) per-candidate expiry probe — shows exactly which Thursday (if any)
+    # 1b) per-candidate expiry probe — shows exactly which Tuesday (if any)
     # AngelOne actually confirms, and what each attempt returned/raised.
     probe = {}
     for cand in _candidate_expiry_strings():
