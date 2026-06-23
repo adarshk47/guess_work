@@ -610,7 +610,8 @@ def render_paper_trade_tab(patterns, spot: float, candle_df: pd.DataFrame = None
                 and (options_df.get("ce_ltp", pd.Series(dtype=float)).fillna(0).abs().sum()
                      + options_df.get("pe_ltp", pd.Series(dtype=float)).fillna(0).abs().sum()) > 0)
     if chain_ok:
-        st.success("💹 Premium source: **Live option chain** (real CE/PE LTP + delta)")
+        src = st.session_state.get("_chain_source", "live")
+        st.success(f"💹 Premium source: **Live option chain** ({src} — real CE/PE LTP + delta)")
     else:
         st.warning("⚠️ Premium source: **Estimated** (option chain unavailable). "
                    "Real premium ke liye chain load hona chahiye — upar 'Data Status' dekho.")
@@ -1112,19 +1113,21 @@ def main():
     # ── Debug expander (auto-opens when the chain is empty so we can diagnose) ─
     expiry_src = st.session_state.get("_expiry_source", "unknown")
     opt_rows = len(options_df) if options_df is not None and not options_df.empty else 0
-    with st.expander(f"🔍 Data Status — Expiry: {expiry_str} | Option strikes: {opt_rows}",
+    chain_src = st.session_state.get("_chain_source", "?")
+    with st.expander(f"🔍 Data Status — Expiry: {expiry_str} | Option strikes: {opt_rows} | Source: {chain_src}",
                      expanded=(opt_rows == 0)):
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Expiry", expiry_str)
         c2.metric("Expiry Source", expiry_src)
         c3.metric("Option Strikes", opt_rows)
+        c4.metric("Chain Source", chain_src)
         if opt_rows == 0:
             st.error("⚠️ Options chain empty — OI / Greeks / Strike tabs blank ho rahe hain.")
         else:
             st.success(f"✅ Options chain loaded — {opt_rows} strikes")
         # Run per-step diagnostics so we can see exactly which API fails
         if st.button("🩺 Run full diagnostics", key="run_diag") or opt_rows == 0:
-            with st.spinner("Checking each AngelOne API step…"):
+            with st.spinner("Checking each AngelOne + NSE step…"):
                 diag = get_options_diagnostics(expiry_str)
             st.json(diag)
 

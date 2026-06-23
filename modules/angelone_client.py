@@ -559,33 +559,31 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
             expiry_str = get_expiry_string(expiry_dt)
 
         obj = get_client()
-        if obj is None:
-            return st.session_state.get("_last_options_df", pd.DataFrame())
-
-        spot = fetch_ltp()
+        spot = fetch_ltp() if obj is not None else 0.0
 
         # ── Stage 1: Greeks via optionGreek (no tokens needed) ───────────────
         greeks_by_key: dict = {}
         greek_strikes: set = set()
-        try:
-            gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
-            if gr and gr.get("status") and gr.get("data"):
-                for g in gr["data"]:
-                    try:
-                        strike = float(g.get("strikePrice", 0))
-                        ot = g.get("optionType", "").upper()
-                        greeks_by_key[(strike, ot)] = g
-                        greek_strikes.add(strike)
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.error(f"optionGreek error: {e}")
+        if obj is not None:
+            try:
+                gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
+                if gr and gr.get("status") and gr.get("data"):
+                    for g in gr["data"]:
+                        try:
+                            strike = float(g.get("strikePrice", 0))
+                            ot = g.get("optionType", "").upper()
+                            greeks_by_key[(strike, ot)] = g
+                            greek_strikes.add(strike)
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.error(f"optionGreek error: {e}")
 
         # ── Stage 2: Market data via tokens (OI / volume / LTP) ──────────────
-        master = _load_nifty_option_master(expiry_str)
+        master = _load_nifty_option_master(expiry_str) if obj is not None else pd.DataFrame()
         strike_opt_to_md: dict = {}
 
-        if not master.empty:
+        if obj is not None and not master.empty:
             all_strikes = sorted(master["strike"].unique())
             if spot and spot > 0:
                 atm = min(all_strikes, key=lambda s: abs(s - spot))
@@ -651,14 +649,55 @@ def fetch_options_chain(expiry_str: str = None) -> pd.DataFrame:
                 row[f"{opt}_vega"]   = float(g.get("vega", 0) or 0)
             rows.append(row)
 
-        if not rows:
-            # Nothing live — return last session's cached data so tabs still show
+        ao_df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True) if rows else pd.DataFrame()
+        ao_has_oi = not ao_df.empty and (ao_df["ce_oi"].sum() + ao_df["pe_oi"].sum()) > 0
+
+        # ── Fallback / supplement: NSE's own public option chain ─────────────
+        # AngelOne's getMarketData (OI/volume) stage depends on token lookups
+        # (scrip master / searchScrip) that have repeatedly failed even during
+        # live market hours. NSE publishes the same chain directly — use it
+        # whenever AngelOne has no OI data, merging in AngelOne's greeks when
+        # we do have them.
+        df = ao_df
+        source = "AngelOne" if ao_has_oi else ""
+        if not ao_has_oi:
+            try:
+                from modules.nse_client import fetch_nse_chain_df
+                nse_df = fetch_nse_chain_df(expiry_str)
+            except Exception as e:
+                logger.error(f"NSE chain fallback error: {e}")
+                nse_df = pd.DataFrame()
+
+            if not nse_df.empty:
+                if not ao_df.empty:
+                    # Keep AngelOne's greeks (Stage 1 optionGreek) where present,
+                    # otherwise fall back to NSE's Black-Scholes-derived greeks.
+                    merged = nse_df.merge(
+                        ao_df[["strike", "ce_delta", "ce_gamma", "ce_theta", "ce_vega",
+                               "pe_delta", "pe_gamma", "pe_theta", "pe_vega"]],
+                        on="strike", how="left", suffixes=("", "_ao"))
+                    for opt in ("ce", "pe"):
+                        for g in ("delta", "gamma", "theta", "vega"):
+                            ao_col = f"{opt}_{g}_ao"
+                            if ao_col in merged.columns:
+                                use_ao = merged[ao_col].abs() > 0
+                                merged.loc[use_ao, f"{opt}_{g}"] = merged.loc[use_ao, ao_col]
+                                merged.drop(columns=[ao_col], inplace=True)
+                    df = merged
+                    source = "AngelOne+NSE"
+                else:
+                    df = nse_df
+                    source = "NSE"
+
+        st.session_state["_chain_source"] = source or "none"
+
+        if df is None or df.empty:
+            # Nothing live from either source — return last session's cache.
             cached = st.session_state.get("_last_options_df", pd.DataFrame())
             if not cached.empty:
-                logger.info("Options chain empty — returning last cached data")
+                logger.info("Options chain empty (AngelOne + NSE) — returning last cached data")
             return cached
 
-        df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
         # Cache so next refresh can fall back to this if live fetch fails
         st.session_state["_last_options_df"] = df.copy()
         st.session_state["_last_options_expiry"] = expiry_str
@@ -679,9 +718,6 @@ def get_options_diagnostics(expiry_str: str = None) -> dict:
     obj = get_client()
     diag["connected"] = obj is not None
     diag["last_error"] = get_last_error() or "—"
-    if obj is None:
-        diag["summary"] = "NOT connected to AngelOne — add secrets and Connect."
-        return diag
 
     if expiry_str is None or expiry_str == "---":
         try:
@@ -691,53 +727,68 @@ def get_options_diagnostics(expiry_str: str = None) -> dict:
     diag["expiry"] = expiry_str
     diag["expiry_source"] = st.session_state.get("_expiry_source", "?")
 
-    # 1) optionGreek — greeks for all strikes (only needs expiry string)
-    try:
-        gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
-        if gr and gr.get("status"):
-            n = len(gr.get("data") or [])
-            diag["optionGreek"] = f"OK — {n} rows"
-        else:
-            msg = gr.get("message") if isinstance(gr, dict) else str(gr)
-            diag["optionGreek"] = f"FAIL — {msg}"
-    except Exception as e:
-        diag["optionGreek"] = f"ERROR — {type(e).__name__}: {e}"
-
-    # 1b) per-candidate expiry probe — shows exactly which Tuesday (if any)
-    # AngelOne actually confirms, and what each attempt returned/raised.
-    probe = {}
-    for cand in _candidate_expiry_strings():
+    if obj is None:
+        diag["summary"] = "NOT connected to AngelOne — chart/AngelOne-side data unavailable. Checking NSE fallback only."
+    else:
+        # 1) optionGreek — greeks for all strikes (only needs expiry string)
         try:
-            gr = obj.optionGreek({"name": "NIFTY", "expirydate": cand})
+            gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
             if gr and gr.get("status"):
-                probe[cand] = f"OK — {len(gr.get('data') or [])} rows"
+                n = len(gr.get("data") or [])
+                diag["optionGreek"] = f"OK — {n} rows"
             else:
                 msg = gr.get("message") if isinstance(gr, dict) else str(gr)
-                probe[cand] = f"FAIL — {msg}"
+                diag["optionGreek"] = f"FAIL — {msg}"
         except Exception as e:
-            probe[cand] = f"ERROR — {type(e).__name__}: {e}"
-    diag["expiry_candidate_probe"] = probe
+            diag["optionGreek"] = f"ERROR — {type(e).__name__}: {e}"
 
-    # 2) scrip master URL (public) — token source
+        # 1b) per-candidate expiry probe — shows exactly which Tuesday (if any)
+        # AngelOne actually confirms, and what each attempt returned/raised.
+        probe = {}
+        for cand in _candidate_expiry_strings():
+            try:
+                gr = obj.optionGreek({"name": "NIFTY", "expirydate": cand})
+                if gr and gr.get("status"):
+                    probe[cand] = f"OK — {len(gr.get('data') or [])} rows"
+                else:
+                    msg = gr.get("message") if isinstance(gr, dict) else str(gr)
+                    probe[cand] = f"FAIL — {msg}"
+            except Exception as e:
+                probe[cand] = f"ERROR — {type(e).__name__}: {e}"
+        diag["expiry_candidate_probe"] = probe
+
+        # 2) scrip master URL (public) — token source
+        try:
+            raw = _load_nifty_master_raw()
+            diag["scrip_master_url"] = f"OK — {len(raw)} NIFTY option rows" if not raw.empty \
+                else "EMPTY — URL reachable but no rows parsed"
+        except Exception as e:
+            diag["scrip_master_url"] = f"ERROR — {type(e).__name__}: {e}"
+
+        # 3) searchScrip API — alternate token source
+        try:
+            res = obj.searchScrip("NFO", "NIFTY")
+            if res and res.get("status"):
+                diag["searchScrip"] = f"OK — {len(res.get('data') or [])} symbols"
+            else:
+                diag["searchScrip"] = f"FAIL — {res.get('message') if isinstance(res, dict) else res}"
+        except Exception as e:
+            diag["searchScrip"] = f"ERROR — {type(e).__name__}: {e}"
+
+    # 4) NSE public chain — independent of AngelOne entirely
     try:
-        raw = _load_nifty_master_raw()
-        diag["scrip_master_url"] = f"OK — {len(raw)} NIFTY option rows" if not raw.empty \
-            else "EMPTY — URL reachable but no rows parsed"
+        from modules.nse_client import fetch_nse_chain_df, get_nse_expiries, get_nse_spot
+        nse_expiries = get_nse_expiries()
+        diag["nse_expiries"] = [d.strftime("%d-%b-%Y") for d in nse_expiries[:3]]
+        diag["nse_spot"] = get_nse_spot()
+        nse_df = fetch_nse_chain_df(expiry_str)
+        diag["nse_chain_rows"] = 0 if nse_df is None or nse_df.empty else len(nse_df)
     except Exception as e:
-        diag["scrip_master_url"] = f"ERROR — {type(e).__name__}: {e}"
+        diag["nse_chain_rows"] = f"ERROR — {type(e).__name__}: {e}"
 
-    # 3) searchScrip API — alternate token source
-    try:
-        res = obj.searchScrip("NFO", "NIFTY")
-        if res and res.get("status"):
-            diag["searchScrip"] = f"OK — {len(res.get('data') or [])} symbols"
-        else:
-            diag["searchScrip"] = f"FAIL — {res.get('message') if isinstance(res, dict) else res}"
-    except Exception as e:
-        diag["searchScrip"] = f"ERROR — {type(e).__name__}: {e}"
-
-    # 4) final assembled chain
+    # 5) final assembled chain (AngelOne + NSE merge, whichever produced data)
     df = fetch_options_chain(expiry_str)
+    diag["chain_source"] = st.session_state.get("_chain_source", "?")
     diag["chain_rows"] = 0 if df is None or df.empty else len(df)
     if diag["chain_rows"]:
         oi_total = int(df["ce_oi"].sum() + df["pe_oi"].sum())
