@@ -69,14 +69,17 @@ def _fetch_raw(retry: bool = True) -> dict:
     sess = _get_session()
     try:
         resp = sess.get(_NSE_CHAIN_URL, timeout=10)
+        st.session_state["_nse_last_status"] = resp.status_code
         if resp.status_code in (401, 403) and retry:
             # Cookies likely stale — drop the session and retry once.
             st.session_state.pop("_nse_session", None)
             return _fetch_raw(retry=False)
         resp.raise_for_status()
+        st.session_state["_nse_last_error"] = ""
         return resp.json()
     except Exception as e:
         logger.debug(f"NSE option chain fetch failed: {e}")
+        st.session_state["_nse_last_error"] = f"{type(e).__name__}: {e}"
         return {}
 
 
@@ -84,6 +87,13 @@ def _fetch_raw(retry: bool = True) -> dict:
 def fetch_nse_chain_raw() -> dict:
     """Raw NSE option-chain-indices JSON for NIFTY, cached for 20s."""
     return _fetch_raw()
+
+
+def get_nse_last_error() -> str:
+    """Last exception/status from the most recent NSE fetch — for diagnostics."""
+    status = st.session_state.get("_nse_last_status", "—")
+    err = st.session_state.get("_nse_last_error", "")
+    return f"HTTP {status}" + (f" — {err}" if err else "")
 
 
 def get_nse_expiries() -> list:

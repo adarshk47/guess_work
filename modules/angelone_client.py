@@ -191,11 +191,18 @@ def _find_valid_nifty_expiry_via_api() -> str:
     Try candidate expiry strings against AngelOne's optionGreek endpoint.
     The first one that returns non-empty data is the correct live expiry.
     Returns expiry string like '19JUN2026', or '' if none found / not connected.
+
+    AngelOne rate-limits this endpoint (observed: "Access denied because of
+    exceeding access rate" when probed back-to-back with no delay) — a short
+    pause between candidates is required or every later candidate fails
+    regardless of whether its expiry is real.
     """
     obj = get_client()
     if obj is None:
         return ""
-    for expiry_str in _candidate_expiry_strings():
+    for i, expiry_str in enumerate(_candidate_expiry_strings()):
+        if i > 0:
+            time.sleep(0.35)
         try:
             gr = obj.optionGreek({"name": "NIFTY", "expirydate": expiry_str})
             # A real expiry returns at least a handful of strikes; an invalid
@@ -379,7 +386,7 @@ import re as _re
 
 _SCRIP_MASTER_URL = (
     "https://margincalculator.angelbroking.com/OpenAPI_File/files/"
-    "OpenAPISymbolMaster.json"
+    "OpenAPIScripMaster.json"
 )
 
 
@@ -744,8 +751,13 @@ def get_options_diagnostics(expiry_str: str = None) -> dict:
 
         # 1b) per-candidate expiry probe — shows exactly which Tuesday (if any)
         # AngelOne actually confirms, and what each attempt returned/raised.
+        # Paced with a delay — calling this back-to-back is what triggers
+        # AngelOne's "exceeding access rate" errors in the first place.
+        time.sleep(0.35)
         probe = {}
-        for cand in _candidate_expiry_strings():
+        for i, cand in enumerate(_candidate_expiry_strings()):
+            if i > 0:
+                time.sleep(0.35)
             try:
                 gr = obj.optionGreek({"name": "NIFTY", "expirydate": cand})
                 if gr and gr.get("status"):
@@ -766,6 +778,7 @@ def get_options_diagnostics(expiry_str: str = None) -> dict:
             diag["scrip_master_url"] = f"ERROR — {type(e).__name__}: {e}"
 
         # 3) searchScrip API — alternate token source
+        time.sleep(0.35)
         try:
             res = obj.searchScrip("NFO", "NIFTY")
             if res and res.get("status"):
@@ -777,16 +790,20 @@ def get_options_diagnostics(expiry_str: str = None) -> dict:
 
     # 4) NSE public chain — independent of AngelOne entirely
     try:
-        from modules.nse_client import fetch_nse_chain_df, get_nse_expiries, get_nse_spot
+        from modules.nse_client import (fetch_nse_chain_df, get_nse_expiries,
+                                         get_nse_spot, get_nse_last_error)
         nse_expiries = get_nse_expiries()
         diag["nse_expiries"] = [d.strftime("%d-%b-%Y") for d in nse_expiries[:3]]
         diag["nse_spot"] = get_nse_spot()
+        diag["nse_last_status"] = get_nse_last_error()
         nse_df = fetch_nse_chain_df(expiry_str)
         diag["nse_chain_rows"] = 0 if nse_df is None or nse_df.empty else len(nse_df)
     except Exception as e:
         diag["nse_chain_rows"] = f"ERROR — {type(e).__name__}: {e}"
 
     # 5) final assembled chain (AngelOne + NSE merge, whichever produced data)
+    if obj is not None:
+        time.sleep(0.35)
     df = fetch_options_chain(expiry_str)
     diag["chain_source"] = st.session_state.get("_chain_source", "?")
     diag["chain_rows"] = 0 if df is None or df.empty else len(df)
