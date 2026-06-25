@@ -23,10 +23,21 @@ def is_market_open() -> bool:
 
 
 def init_paper_trades():
+    """
+    First call in a session seeds today's trades from Firestore (if
+    configured), so a brand-new visitor immediately sees what the background
+    fetcher — or another visitor's session — already recorded today.
+    """
     if "paper_trades" not in st.session_state:
-        st.session_state["paper_trades"] = []
+        from modules.firebase_client import get_todays_trades
+        try:
+            seeded = get_todays_trades()
+        except Exception:
+            seeded = []
+        st.session_state["paper_trades"] = seeded
     if "paper_trade_counter" not in st.session_state:
-        st.session_state["paper_trade_counter"] = 0
+        existing_ids = [t.get("id", 0) for t in st.session_state["paper_trades"]]
+        st.session_state["paper_trade_counter"] = max(existing_ids) if existing_ids else 0
 
 
 # Default ATM option delta used when the live chain has no greek data.
@@ -172,6 +183,11 @@ def add_paper_trade(signal, pattern_name: str, spot_price: float,
         "confidence": getattr(signal, "confidence", "MEDIUM"),
     }
     st.session_state["paper_trades"].append(trade)
+    from modules.firebase_client import save_trade
+    try:
+        save_trade(trade)
+    except Exception:
+        pass
     return trade_id
 
 
@@ -207,6 +223,11 @@ def update_paper_trades(current_spot: float):
                 pnl_pct=round((exit_prem - entry_prem) / entry_prem * 100, 2)
                 if entry_prem else 0.0,
             )
+            from modules.firebase_client import save_trade
+            try:
+                save_trade(trade)
+            except Exception:
+                pass
 
         if direction == "BUY":          # bullish → bought a CE
             if current_spot <= idx_sl:

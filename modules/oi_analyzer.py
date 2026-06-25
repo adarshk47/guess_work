@@ -47,15 +47,31 @@ def get_oi_snapshot() -> dict:
 
 
 def store_oi_snapshot(snapshot: dict):
-    """Store OI snapshot with timestamp in session_state history."""
+    """
+    Store OI snapshot with timestamp in session_state history.
+
+    The first call in a session seeds the last 2 hours from Firestore (if
+    configured), so a brand-new visitor sees OI trend history immediately
+    instead of starting from zero.
+    """
     if "oi_history" not in st.session_state:
-        st.session_state["oi_history"] = []
+        from modules.firebase_client import get_oi_history
+        try:
+            st.session_state["oi_history"] = get_oi_history(hours=2)
+        except Exception:
+            st.session_state["oi_history"] = []
 
     entry = {
         "timestamp": datetime.now(IST),
         "snapshot": snapshot,
     }
     st.session_state["oi_history"].append(entry)
+
+    from modules.firebase_client import save_oi_snapshot
+    try:
+        save_oi_snapshot(entry["timestamp"], snapshot)
+    except Exception:
+        pass
 
     # Keep only last 2 hours of data
     cutoff = datetime.now(IST) - timedelta(hours=2)

@@ -1114,13 +1114,16 @@ def main():
     expiry_src = st.session_state.get("_expiry_source", "unknown")
     opt_rows = len(options_df) if options_df is not None and not options_df.empty else 0
     chain_src = st.session_state.get("_chain_source", "?")
+    from modules.firebase_client import is_configured as _firestore_configured
+    firestore_status = "🟢 Connected" if _firestore_configured() else "⚪ Not configured"
     with st.expander(f"🔍 Data Status — Expiry: {expiry_str} | Option strikes: {opt_rows} | Source: {chain_src}",
                      expanded=(opt_rows == 0)):
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Expiry", expiry_str)
         c2.metric("Expiry Source", expiry_src)
         c3.metric("Option Strikes", opt_rows)
         c4.metric("Chain Source", chain_src)
+        c5.metric("Firestore", firestore_status)
         if opt_rows == 0:
             st.error("⚠️ Options chain empty — OI / Greeks / Strike tabs blank ho rahe hain.")
         else:
