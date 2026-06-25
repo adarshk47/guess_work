@@ -46,7 +46,7 @@ def _install_streamlit_shim():
             "mpin": os.environ.get("ANGEL_MPIN", ""),
             "totp_secret": os.environ.get("ANGEL_TOTP_SECRET", ""),
         },
-        "firebase": json.loads(os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "{}")),
+        "firebase": json.loads(os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON") or "{}"),
     }
 
     def cache_data(*args, **kwargs):
